@@ -1,0 +1,398 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { User, Zap, ShieldAlert, Target, TrendingUp, Clock, Activity, Send, Loader2, Settings, X } from 'lucide-react';
+
+interface Signal {
+  id: string;
+  traderName: string;
+  successRate: string;
+  time: string;
+  pair: { base: string; quote: string };
+  action: 'buy' | 'sell';
+  entry: string;
+  stopLoss: string;
+  takeProfits: { t1: string; t2: string; t3: string };
+  analysis: string;
+  halalStatus?: 'halal' | 'haram' | 'doubtful' | 'unknown';
+}
+
+const getHalalBadge = (status?: string) => {
+  if (status === 'halal') return <span className="px-2 py-0.5 bg-green-500/10 text-green-400 text-xs rounded-full border border-green-500/20">حلال 🟢</span>;
+  if (status === 'haram') return <span className="px-2 py-0.5 bg-red-500/10 text-red-400 text-xs rounded-full border border-red-500/20">حرام 🔴</span>;
+  if (status === 'doubtful') return <span className="px-2 py-0.5 bg-yellow-500/10 text-yellow-400 text-xs rounded-full border border-yellow-500/20">شبهة 🟡</span>;
+  return null;
+};
+
+export default function App() {
+  const [signals, setSignals] = useState<Signal[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isLive, setIsLive] = useState(true);
+  const [prices, setPrices] = useState<Record<string, number>>({});
+  const [signalStatus, setSignalStatus] = useState<Record<string, 'active' | 't1' | 't2' | 't3' | 'sl'>>({});
+  const [isSending, setIsSending] = useState<Record<string, boolean>>({});
+  
+  const [traderStats, setTraderStats] = useState<Record<string, { wins: number, total: number }>>(() => {
+    const saved = localStorage.getItem('traderStats');
+    if (saved) return JSON.parse(saved);
+    return {
+      'RSI Oversold (1h)': { wins: 0, total: 0 },
+      'Volume Breakout (1h)': { wins: 0, total: 0 }
+    };
+  });
+  const [showSettings, setShowSettings] = useState(false);
+  const [telegramToken, setTelegramToken] = useState('');
+  const [telegramChatId, setTelegramChatId] = useState('');
+  
+  const telegramSettingsRef = useRef({ token: '', chatId: '' });
+
+  useEffect(() => {
+    const savedToken = localStorage.getItem('telegramToken');
+    const savedChatId = localStorage.getItem('telegramChatId');
+    if (savedToken) {
+      setTelegramToken(savedToken);
+      telegramSettingsRef.current.token = savedToken;
+    }
+    if (savedChatId) {
+      setTelegramChatId(savedChatId);
+      telegramSettingsRef.current.chatId = savedChatId;
+    }
+  }, []);
+
+  const saveSettings = async () => {
+    localStorage.setItem('telegramToken', telegramToken);
+    localStorage.setItem('telegramChatId', telegramChatId);
+    telegramSettingsRef.current = { token: telegramToken, chatId: telegramChatId };
+    
+    try {
+      await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: telegramToken, chatId: telegramChatId })
+      });
+    } catch (error) {}
+    
+    setShowSettings(false);
+  };
+
+  useEffect(() => {
+    const fetchState = async () => {
+      try {
+        const response = await fetch('/api/state');
+        if (!response.ok) return;
+        const text = await response.text();
+        
+        if (text.trim().toLowerCase().startsWith('<!doctype') || text.includes('<html')) return;
+        
+        try {
+          const data = JSON.parse(text);
+          setSignals(data.signals || []);
+          setPrices(data.prices || {});
+          setSignalStatus(data.signalStatus || {});
+          setTraderStats(data.traderStats || {});
+          setIsLoading(false);
+        } catch (e) {}
+      } catch (error) {}
+    };
+
+    fetchState();
+    const interval = setInterval(fetchState, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const sendToTelegram = async (message: string) => {
+    const token = telegramSettingsRef.current.token || telegramToken;
+    const chatId = telegramSettingsRef.current.chatId || telegramChatId;
+    
+    if (!token || !chatId) return;
+    
+    try {
+      await fetch('/api/telegram', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message, token, chatId })
+      });
+    } catch (error) {}
+  };
+
+  const shareSignal = async (signal: Signal) => {
+    setIsSending(prev => ({ ...prev, [signal.id]: true }));
+    const msg = `🚀 <b>توصية جديدة من ${signal.traderName}</b>\n\n` +
+      `الزوج: #${signal.pair.base}_${signal.pair.quote}\n` +
+      `النوع: ${signal.action === 'buy' ? 'شراء 🟢' : 'بيع 🔴'}\n` +
+      `الدخول: ${signal.entry}\n\n` +
+      `الأهداف:\n` +
+      `🎯 T1: ${signal.takeProfits.t1}\n` +
+      `🎯 T2: ${signal.takeProfits.t2}\n` +
+      `🎯 T3: ${signal.takeProfits.t3}\n\n` +
+      `🛑 وقف الخسارة: ${signal.stopLoss}\n\n` +
+      `📊 التحليل: ${signal.analysis}`;
+      
+    await sendToTelegram(msg);
+    setIsSending(prev => ({ ...prev, [signal.id]: false }));
+  };
+
+  useEffect(() => {
+    if (signals.length === 0) return;
+    
+    const streams = signals.map(s => `${s.pair.base.toLowerCase()}${s.pair.quote.toLowerCase()}@ticker`).join('/');
+    const ws = new WebSocket(`wss://stream.binance.com:9443/ws/${streams}`);
+
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      if (data.s && data.c) {
+        setPrices(prev => ({ ...prev, [data.s]: parseFloat(data.c) }));
+      }
+    };
+
+    return () => ws.close();
+  }, [signals]);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setIsLive(prev => !prev);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  return (
+    <div className="min-h-screen bg-[#0B0E14] text-slate-300 font-sans p-4 md:p-6 flex justify-center" dir="rtl">
+      <div className="w-full max-w-2xl space-y-6">
+        
+        <header className="flex flex-col items-center justify-center gap-2 border-b border-slate-800/60 pb-6 pt-4 relative">
+          <div className="flex items-center gap-3">
+            <div className="flex items-center justify-center w-10 h-10 rounded-full bg-yellow-500/10 border border-yellow-500/20">
+              <Activity className="w-5 h-5 text-yellow-500" />
+            </div>
+            <div className="text-center">
+              <h1 className="text-2xl font-bold text-white tracking-wide">بث التحليل الفني</h1>
+              <p className="text-slate-400 text-sm font-mono tracking-widest uppercase mt-1">ALGORITHMIC SIGNALS</p>
+            </div>
+          </div>
+          
+          <div className="flex items-center gap-2 mt-2 bg-slate-900/80 px-4 py-1.5 rounded-full border border-slate-800">
+            <span className="relative flex h-2.5 w-2.5">
+              <span className={`animate-ping absolute inline-flex h-full w-full rounded-full bg-red-500 opacity-75 ${isLive ? 'block' : 'hidden'}`}></span>
+              <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-red-500"></span>
+            </span>
+            <span className="text-xs text-slate-300 font-medium">إيقاف البث</span>
+          </div>
+          
+          <button 
+            onClick={() => setShowSettings(true)}
+            className="absolute top-4 left-4 p-2 bg-slate-800/50 hover:bg-slate-800 rounded-full border border-slate-700/50 transition-colors"
+            title="إعدادات تيليجرام"
+          >
+            <Settings className="w-5 h-5 text-slate-400" />
+          </button>
+        </header>
+
+        {!isLoading && signals.length > 0 && (
+          <div className="grid grid-cols-4 gap-3">
+            <div className="bg-[#181B22] border border-slate-800 rounded-2xl p-3 flex flex-col items-center justify-center text-center">
+              <span className="text-slate-400 text-xs mb-1">الإجمالي</span>
+              <span className="text-white font-bold text-lg font-mono">{signals.length}</span>
+            </div>
+            <div className="bg-emerald-500/10 border border-emerald-500/20 rounded-2xl p-3 flex flex-col items-center justify-center text-center">
+              <span className="text-emerald-500 text-xs mb-1">ناجحة</span>
+              <span className="text-emerald-400 font-bold text-lg font-mono">
+                {signals.filter(s => ['t1', 't2', 't3'].includes(signalStatus[s.id])).length}
+              </span>
+            </div>
+            <div className="bg-red-500/10 border border-red-500/20 rounded-2xl p-3 flex flex-col items-center justify-center text-center">
+              <span className="text-red-500 text-xs mb-1">خاسرة</span>
+              <span className="text-red-400 font-bold text-lg font-mono">
+                {signals.filter(s => signalStatus[s.id] === 'sl').length}
+              </span>
+            </div>
+            <div className="bg-[#2A82DA]/10 border border-[#2A82DA]/20 rounded-2xl p-3 flex flex-col items-center justify-center text-center">
+              <span className="text-[#2A82DA] text-xs mb-1">نشطة</span>
+              <span className="text-[#2A82DA] font-bold text-lg font-mono">
+                {signals.filter(s => !['t1', 't2', 't3', 'sl'].includes(signalStatus[s.id])).length}
+              </span>
+            </div>
+          </div>
+        )}
+
+        {showSettings && (
+          <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+            <div className="bg-[#181B22] border border-slate-700 rounded-2xl p-6 w-full max-w-md shadow-2xl relative">
+              <button 
+                onClick={() => setShowSettings(false)}
+                className="absolute top-4 left-4 p-1 text-slate-400 hover:text-white"
+              >
+                <X className="w-5 h-5" />
+              </button>
+              
+              <h2 className="text-xl font-bold text-white mb-6 flex items-center gap-2">
+                <Send className="w-5 h-5 text-[#2A82DA]" />
+                إعدادات تيليجرام
+              </h2>
+              
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-sm font-medium text-slate-300 mb-1.5">
+                    توكن البوت (Bot Token)
+                  </label>
+                  <input 
+                    type="text" 
+                    value={telegramToken}
+                    onChange={(e) => setTelegramToken(e.target.value)}
+                    placeholder="123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
+                    className="w-full bg-[#0B0E14] border border-slate-700 rounded-xl px-4 py-2.5 text-white text-sm focus:outline-none focus:border-[#2A82DA] transition-colors"
+                    dir="ltr"
+                  />
+                </div>
+                
+                <div>
+                  <label className="block text-sm font-medium text-slate-300 mb-1.5">
+                    معرف المحادثة (Chat ID)
+                  </label>
+                  <input 
+                    type="text" 
+                    value={telegramChatId}
+                    onChange={(e) => setTelegramChatId(e.target.value)}
+                    placeholder="-1001234567890"
+                    className="w-full bg-[#0B0E14] border border-slate-700 rounded-xl px-4 py-2.5 text-white text-sm focus:outline-none focus:border-[#2A82DA] transition-colors"
+                    dir="ltr"
+                  />
+                </div>
+                
+                <button 
+                  onClick={saveSettings}
+                  className="w-full bg-[#2A82DA] hover:bg-[#2A82DA]/90 text-white font-medium py-2.5 rounded-xl transition-colors mt-2"
+                >
+                  حفظ الإعدادات
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div className="space-y-6">
+          {isLoading ? (
+            <div className="flex flex-col items-center justify-center py-20 gap-4">
+              <Loader2 className="w-8 h-8 text-emerald-500 animate-spin" />
+              <p className="text-slate-400">جاري جلب أحدث التوصيات الحية...</p>
+            </div>
+          ) : signals.map((signal) => (
+            <div key={signal.id} className="bg-[#181B22] border border-slate-800/80 rounded-[24px] p-5 shadow-xl">
+              
+              <div className="flex justify-between items-start mb-6">
+                <div className="flex flex-col gap-3">
+                  <div className="flex items-center gap-2">
+                    <div className="inline-flex items-center gap-1.5 bg-[#222630] px-3 py-1.5 rounded-full border border-slate-700/50 w-fit">
+                      <span className="text-xs text-slate-400 font-mono">{signal.pair.quote}/</span>
+                      <span className="text-sm font-bold text-white font-mono">{signal.pair.base}</span>
+                    </div>
+                    {getHalalBadge(signal.halalStatus)}
+                  </div>
+                  
+                  <div className="flex items-center gap-2">
+                    <Zap className="w-4 h-4 text-yellow-500 fill-yellow-500" />
+                    <span className="font-bold text-white text-lg">{signal.traderName}</span>
+                    <span className="bg-emerald-500/10 text-emerald-400 text-xs px-2 py-0.5 rounded-full border border-emerald-500/20 font-medium">
+                      نسبة النجاح: {signal.successRate}
+                    </span>
+                  </div>
+                  
+                  <div className="flex items-center gap-1.5 text-slate-500 text-xs">
+                    <Clock className="w-3.5 h-3.5" />
+                    <span dir="ltr">{signal.time}</span>
+                  </div>
+                </div>
+
+                <div className="flex flex-col items-end gap-3">
+                  <div className="w-12 h-12 rounded-full bg-[#222630] border border-slate-700/50 flex items-center justify-center">
+                    <User className="w-6 h-6 text-slate-400" />
+                  </div>
+                  
+                  <div className="bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 px-4 py-1.5 rounded-lg flex items-center gap-1.5 font-bold text-sm">
+                    <span>شراء</span>
+                    <TrendingUp className="w-4 h-4" />
+                  </div>
+                  
+                  <button 
+                    onClick={() => shareSignal(signal)}
+                    disabled={isSending[signal.id]}
+                    className="flex items-center gap-1.5 text-xs bg-[#2A82DA]/10 text-[#2A82DA] border border-[#2A82DA]/30 px-3 py-1.5 rounded-lg hover:bg-[#2A82DA]/20 transition-colors disabled:opacity-50"
+                  >
+                    <Send className="w-3.5 h-3.5" />
+                    <span>{isSending[signal.id] ? 'جاري الإرسال...' : 'إرسال لتيليجرام'}</span>
+                  </button>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-4 mb-4">
+                <div className={`border rounded-2xl p-4 flex flex-col items-center justify-center gap-2 transition-colors ${signalStatus[signal.id] === 'sl' ? 'bg-red-500/20 border-red-500/50' : 'bg-[#2A1E22] border-[#4A2A2E]'}`}>
+                  <div className="flex items-center gap-1.5 text-[#FF6B6B] text-sm font-medium">
+                    <ShieldAlert className="w-4 h-4" />
+                    <span>وقف الخسارة</span>
+                  </div>
+                  <div className="text-[#FF6B6B] text-2xl font-bold font-mono tracking-wider">
+                    {signal.stopLoss}
+                  </div>
+                </div>
+
+                <div className="bg-[#1E222B] border border-slate-700/50 rounded-2xl p-4 flex flex-col items-center justify-center gap-2">
+                  <div className="flex items-center gap-1.5 text-slate-300 text-sm font-medium">
+                    <Target className="w-4 h-4" />
+                    <span>الدخول</span>
+                  </div>
+                  <div className="text-white text-2xl font-bold font-mono tracking-wider">
+                    {signal.entry}
+                  </div>
+                  {prices[`${signal.pair.base}${signal.pair.quote}`] && (
+                    <div className="text-xs text-slate-400 font-mono mt-1">
+                      الحالي: {prices[`${signal.pair.base}${signal.pair.quote}`]}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="bg-[#1E222B] border border-slate-700/50 rounded-2xl p-5 mb-5">
+                <div className="flex items-center justify-center gap-2 text-slate-300 text-sm font-medium mb-4">
+                  <TrendingUp className="w-4 h-4" />
+                  <span>الأهداف (Take Profit)</span>
+                </div>
+                
+                <div className="flex flex-wrap justify-center gap-3">
+                  <div className={`border px-4 py-2 rounded-xl flex items-center gap-2 transition-colors ${['t1', 't2', 't3'].includes(signalStatus[signal.id] || '') ? 'bg-emerald-500/20 border-emerald-500/50' : 'bg-[#1A2C26] border-[#2A4A3E]'}`}>
+                    <span className="text-emerald-400 font-bold font-mono text-lg">{signal.takeProfits.t1}</span>
+                    <span className="text-emerald-500/70 text-xs font-bold">T1</span>
+                  </div>
+                  <div className={`border px-4 py-2 rounded-xl flex items-center gap-2 transition-colors ${['t2', 't3'].includes(signalStatus[signal.id] || '') ? 'bg-emerald-500/20 border-emerald-500/50' : 'bg-[#1A2C26] border-[#2A4A3E]'}`}>
+                    <span className="text-emerald-400 font-bold font-mono text-lg">{signal.takeProfits.t2}</span>
+                    <span className="text-emerald-500/70 text-xs font-bold">T2</span>
+                  </div>
+                  <div className={`border px-4 py-2 rounded-xl flex items-center gap-2 transition-colors ${signalStatus[signal.id] === 't3' ? 'bg-emerald-500/20 border-emerald-500/50' : 'bg-[#1A2C26] border-[#2A4A3E]'}`}>
+                    <span className="text-emerald-400 font-bold font-mono text-lg">{signal.takeProfits.t3}</span>
+                    <span className="text-emerald-500/70 text-xs font-bold">T3</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="border-t border-slate-800/80 pt-4 mt-5 flex flex-col gap-4">
+                <div className="text-slate-400 text-sm leading-relaxed">
+                  {signal.analysis}
+                </div>
+                
+                <a 
+                  href={`https://www.binance.com/en/trade/${signal.pair.base}_${signal.pair.quote}?type=spot`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="w-full bg-[#FCD535] hover:bg-[#FCD535]/90 text-black font-bold py-3 px-4 rounded-xl flex items-center justify-center gap-2 transition-colors"
+                >
+                  <svg viewBox="0 0 24 24" className="w-5 h-5 fill-current">
+                    <path d="M16.624 13.9202l2.7175 2.7154-7.353 7.353-7.353-7.352 2.7175-2.7164 4.6355 4.6595 4.6356-4.6595zm4.6366-4.6366L24 12l-2.7154 2.7164L18.568 12l2.6926-2.7164zm-9.272.001l2.7163 2.6914-2.7164 2.7174v-.001L9.271 12l2.718-2.7154zm-9.2722-.001L5.409 12 2.7164 14.7164 0 12l2.7164-2.7164zM11.9885.0115l7.353 7.329-2.7174 2.7154-4.6356-4.6356-4.6355 4.6595-2.7174-2.7154 7.353-7.353z"/>
+                  </svg>
+                  تداول الآن على تطبيق Binance
+                </a>
+              </div>
+
+            </div>
+          ))}
+        </div>
+
+      </div>
+    </div>
+  );
+}
